@@ -8,7 +8,6 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 contract OrderBook {
     using SafeERC20 for IERC20;
 
-    // Custom errors save gas compared to require + string messages
     error InvalidAmount();
     error InvalidPrice();
     error PriceMismatch();
@@ -45,8 +44,48 @@ contract OrderBook {
         tokenB = IERC20(_tokenB);
     }
 
-    function placeBuyOrder(uint256 amount, uint256 price) external returns (uint256 orderId) {}
-    function placeSellOrder(uint256 amount, uint256 price) external returns (uint256 orderId) {}
+    // Pull the full tokenB quote upfront so funds are locked until matched or cancelled
+    function placeBuyOrder(uint256 amount, uint256 price) external returns (uint256 orderId) {
+        if (amount == 0) revert InvalidAmount();
+        if (price == 0) revert InvalidPrice();
+
+        orderId = _orderCounter++;
+        // Lock amount * price tokenB from the buyer
+        tokenB.safeTransferFrom(msg.sender, address(this), amount * price);
+
+        _orders[orderId] = Order({
+            creator: msg.sender,
+            amount: amount,
+            filled: 0,
+            price: price,
+            isBuyOrder: true,
+            isOpen: true
+        });
+
+        emit OrderPlaced(orderId, msg.sender, orderId, address(tokenB), address(tokenA), amount, price);
+    }
+
+    // Pull the tokenA from the seller upfront
+    function placeSellOrder(uint256 amount, uint256 price) external returns (uint256 orderId) {
+        if (amount == 0) revert InvalidAmount();
+        if (price == 0) revert InvalidPrice();
+
+        orderId = _orderCounter++;
+        // Lock seller's tokenA in the contract
+        tokenA.safeTransferFrom(msg.sender, address(this), amount);
+
+        _orders[orderId] = Order({
+            creator: msg.sender,
+            amount: amount,
+            filled: 0,
+            price: price,
+            isBuyOrder: false,
+            isOpen: true
+        });
+
+        emit OrderPlaced(orderId, msg.sender, orderId, address(tokenA), address(tokenB), amount, price);
+    }
+
     function matchOrders(uint256 buyOrderId, uint256 sellOrderId) external {}
     function cancelOrder(uint256 orderId) external {}
     function remaining(uint256 orderId) external view returns (uint256) {}
