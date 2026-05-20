@@ -44,49 +44,51 @@ contract OrderBook {
         tokenB = IERC20(_tokenB);
     }
 
-    // Pull the full tokenB quote upfront so funds are locked until matched or cancelled
     function placeBuyOrder(uint256 amount, uint256 price) external returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
         if (price == 0) revert InvalidPrice();
-
         orderId = _orderCounter++;
-        // Lock amount * price tokenB from the buyer
         tokenB.safeTransferFrom(msg.sender, address(this), amount * price);
-
-        _orders[orderId] = Order({
-            creator: msg.sender,
-            amount: amount,
-            filled: 0,
-            price: price,
-            isBuyOrder: true,
-            isOpen: true
-        });
-
+        _orders[orderId] = Order({ creator: msg.sender, amount: amount, filled: 0, price: price, isBuyOrder: true, isOpen: true });
         emit OrderPlaced(orderId, msg.sender, orderId, address(tokenB), address(tokenA), amount, price);
     }
 
-    // Pull the tokenA from the seller upfront
     function placeSellOrder(uint256 amount, uint256 price) external returns (uint256 orderId) {
         if (amount == 0) revert InvalidAmount();
         if (price == 0) revert InvalidPrice();
-
         orderId = _orderCounter++;
-        // Lock seller's tokenA in the contract
         tokenA.safeTransferFrom(msg.sender, address(this), amount);
-
-        _orders[orderId] = Order({
-            creator: msg.sender,
-            amount: amount,
-            filled: 0,
-            price: price,
-            isBuyOrder: false,
-            isOpen: true
-        });
-
+        _orders[orderId] = Order({ creator: msg.sender, amount: amount, filled: 0, price: price, isBuyOrder: false, isOpen: true });
         emit OrderPlaced(orderId, msg.sender, orderId, address(tokenA), address(tokenB), amount, price);
     }
 
-    function matchOrders(uint256 buyOrderId, uint256 sellOrderId) external {}
+    // Match a buy order with a sell order. Handles partial fills automatically.
+    // fillAmount = min(buyRemaining, sellRemaining) so neither order overfills.
+    function matchOrders(uint256 buyOrderId, uint256 sellOrderId) external {
+        Order storage buyOrder  = _orders[buyOrderId];
+        Order storage sellOrder = _orders[sellOrderId];
+
+        // Buyer must be willing to pay at least the seller's asking price
+        if (buyOrder.price < sellOrder.price) revert PriceMismatch();
+
+        uint256 buyRemaining  = buyOrder.amount  - buyOrder.filled;
+        uint256 sellRemaining = sellOrder.amount - sellOrder.filled;
+        uint256 fillAmount    = buyRemaining < sellRemaining ? buyRemaining : sellRemaining;
+
+        // Update state before transfers (checks-effects-interactions)
+        buyOrder.filled  += fillAmount;
+        sellOrder.filled += fillAmount;
+
+        if (buyOrder.filled  == buyOrder.amount)  buyOrder.isOpen  = false;
+        if (sellOrder.filled == sellOrder.amount) sellOrder.isOpen = false;
+
+        // Deliver tokenA to buyer and tokenB to seller
+        tokenA.safeTransfer(buyOrder.creator,  fillAmount);
+        tokenB.safeTransfer(sellOrder.creator, fillAmount * buyOrder.price);
+
+        emit OrderMatched(buyOrderId, sellOrderId);
+    }
+
     function cancelOrder(uint256 orderId) external {}
     function remaining(uint256 orderId) external view returns (uint256) {}
     function isOpen(uint256 orderId) external view returns (bool) {}
