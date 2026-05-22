@@ -4,7 +4,6 @@ pragma solidity ^0.8.30;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-// Order book DEX — trades tokenA (PNPT) against tokenB (FNBT)
 contract OrderBook {
     using SafeERC20 for IERC20;
 
@@ -62,34 +61,43 @@ contract OrderBook {
         emit OrderPlaced(orderId, msg.sender, orderId, address(tokenA), address(tokenB), amount, price);
     }
 
-    // Match a buy order with a sell order. Handles partial fills automatically.
-    // fillAmount = min(buyRemaining, sellRemaining) so neither order overfills.
     function matchOrders(uint256 buyOrderId, uint256 sellOrderId) external {
         Order storage buyOrder  = _orders[buyOrderId];
         Order storage sellOrder = _orders[sellOrderId];
-
-        // Buyer must be willing to pay at least the seller's asking price
         if (buyOrder.price < sellOrder.price) revert PriceMismatch();
-
         uint256 buyRemaining  = buyOrder.amount  - buyOrder.filled;
         uint256 sellRemaining = sellOrder.amount - sellOrder.filled;
         uint256 fillAmount    = buyRemaining < sellRemaining ? buyRemaining : sellRemaining;
-
-        // Update state before transfers (checks-effects-interactions)
         buyOrder.filled  += fillAmount;
         sellOrder.filled += fillAmount;
-
         if (buyOrder.filled  == buyOrder.amount)  buyOrder.isOpen  = false;
         if (sellOrder.filled == sellOrder.amount) sellOrder.isOpen = false;
-
-        // Deliver tokenA to buyer and tokenB to seller
         tokenA.safeTransfer(buyOrder.creator,  fillAmount);
         tokenB.safeTransfer(sellOrder.creator, fillAmount * buyOrder.price);
-
         emit OrderMatched(buyOrderId, sellOrderId);
     }
 
-    function cancelOrder(uint256 orderId) external {}
-    function remaining(uint256 orderId) external view returns (uint256) {}
-    function isOpen(uint256 orderId) external view returns (bool) {}
+    // Cancel and refund the unspent portion back to the creator
+    function cancelOrder(uint256 orderId) external {
+        Order storage order = _orders[orderId];
+        if (order.creator != msg.sender) revert UnauthorizedCancellation();
+        order.isOpen = false;
+        uint256 unfilled = order.amount - order.filled;
+        if (order.isBuyOrder) {
+            // Refund the tokenB that was locked but not used
+            tokenB.safeTransfer(msg.sender, unfilled * order.price);
+        } else {
+            tokenA.safeTransfer(msg.sender, unfilled);
+        }
+        emit OrderCanceled(orderId);
+    }
+
+    function remaining(uint256 orderId) external view returns (uint256) {
+        Order storage order = _orders[orderId];
+        return order.amount - order.filled;
+    }
+
+    function isOpen(uint256 orderId) external view returns (bool) {
+        return _orders[orderId].isOpen;
+    }
 }
