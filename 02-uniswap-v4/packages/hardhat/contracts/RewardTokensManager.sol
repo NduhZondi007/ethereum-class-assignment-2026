@@ -13,22 +13,25 @@ import { Actions } from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import { IPositionManager } from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-// Extends IPositionManager with functions not in the base interface
 interface IPositionManagerExt is IPositionManager {
     function permit2() external view returns (address);
     function nextTokenId() external view returns (uint256);
 }
 
-// Manages a Uniswap v4 pool for PNPT/FNBT reward tokens.
-// Assignment pricing: 1 FNBT = R0.10, 1 PNPT = R0.01, so 1 FNBT = 10 PNPT.
 contract RewardTokensManager {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    // Pool configuration
-    uint24 public constant FEE_TIER     = 3000; // 0.3%
+    uint24 public constant FEE_TIER     = 3000;
     int24  public constant TICK_SPACING = 60;
     address public constant HOOKS       = address(0);
+
+    // Assignment pricing: 1 FNBT = 10 PNPT
+    // Uniswap price = currency1 / currency0
+    // If PNPT < FNBT: price = FNBT/PNPT = 0.1, tick = floor(log(0.1)/log(1.0001)) = -23028
+    // If FNBT < PNPT: price = PNPT/FNBT = 10,  tick = floor(log(10)/log(1.0001))  =  23027
+    int24 private constant TICK_PNPT_IS_C0 = -23028;
+    int24 private constant TICK_FNBT_IS_C0 =  23027;
 
     IPoolManager         public immutable poolManager;
     IPositionManagerExt  public immutable positionManager;
@@ -40,33 +43,12 @@ contract RewardTokensManager {
     bytes32  private _poolId;
     mapping(bytes32 => bool) public createdPools;
 
-    event PoolCreated(
-        bytes32 poolId,
-        address currency0,
-        address currency1,
-        uint24  fee,
-        int24   tickSpacing,
-        address hooks,
-        uint160 sqrtPriceX96
-    );
-
-    event LiquidityMinted(
-        bytes32 poolId,
-        uint256 positionId,
-        address owner,
-        int24   tickLower,
-        int24   tickUpper,
-        uint128 liquidity
-    );
+    event PoolCreated(bytes32 poolId, address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96);
+    event LiquidityMinted(bytes32 poolId, uint256 positionId, address owner, int24 tickLower, int24 tickUpper, uint128 liquidity);
 
     error TickRangeDoesNotCoverAssignmentPrice();
 
-    constructor(
-        address _poolManager,
-        address _positionManager,
-        address _pnpToken,
-        address _fnbToken
-    ) {
+    constructor(address _poolManager, address _positionManager, address _pnpToken, address _fnbToken) {
         poolManager     = IPoolManager(_poolManager);
         positionManager = IPositionManagerExt(_positionManager);
         pnpToken        = _pnpToken;
@@ -74,8 +56,6 @@ contract RewardTokensManager {
         _permit2        = IPositionManagerExt(_positionManager).permit2();
     }
 
-    // Returns the canonical (sorted by address) currency pair for this pool.
-    // Uniswap v4 requires currency0 < currency1 by address.
     function getCanonicalCurrencies() public view returns (address currency0, address currency1) {
         if (pnpToken < fnbToken) {
             return (pnpToken, fnbToken);
@@ -88,10 +68,16 @@ contract RewardTokensManager {
         return _poolId;
     }
 
-    function getTargetTick() public view returns (int24) {}
+    // Returns the tick that corresponds to the assignment exchange rate (1 FNBT = 10 PNPT).
+    // The tick depends on which token ends up as currency0 (determined by address ordering).
+    // We compute this at runtime because token addresses are only known post-deployment.
+    function getTargetTick() public view returns (int24) {
+        (address c0, ) = getCanonicalCurrencies();
+        // If PNPT is the lower address it becomes currency0, price = FNBT/PNPT = 0.1 → tick -23028
+        // If FNBT is the lower address it becomes currency0, price = PNPT/FNBT = 10  → tick  23027
+        return (c0 == pnpToken) ? TICK_PNPT_IS_C0 : TICK_FNBT_IS_C0;
+    }
 
-    // Initialises the pool in Uniswap v4 PoolManager with 0.3% fee, tick spacing 60, no hooks.
-    // sqrtPriceX96 sets the starting price of the pool.
     function createPool(uint160 sqrtPriceX96) external returns (bytes32 poolId) {
         (address c0addr, address c1addr) = getCanonicalCurrencies();
 
@@ -103,12 +89,10 @@ contract RewardTokensManager {
             hooks:       IHooks(HOOKS)
         });
 
-        // The pool ID is a deterministic hash of the pool key
         poolId  = PoolId.unwrap(_poolKey.toId());
         _poolId = poolId;
         createdPools[poolId] = true;
 
-        // Initialise the pool in PoolManager at the given starting price
         poolManager.initialize(_poolKey, sqrtPriceX96);
 
         emit PoolCreated(poolId, c0addr, c1addr, FEE_TIER, TICK_SPACING, HOOKS, sqrtPriceX96);
