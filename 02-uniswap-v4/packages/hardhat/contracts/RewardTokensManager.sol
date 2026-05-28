@@ -26,10 +26,6 @@ contract RewardTokensManager {
     int24  public constant TICK_SPACING = 60;
     address public constant HOOKS       = address(0);
 
-    // Assignment pricing: 1 FNBT = 10 PNPT
-    // Uniswap price = currency1 / currency0
-    // If PNPT < FNBT: price = FNBT/PNPT = 0.1, tick = floor(log(0.1)/log(1.0001)) = -23028
-    // If FNBT < PNPT: price = PNPT/FNBT = 10,  tick = floor(log(10)/log(1.0001))  =  23027
     int24 private constant TICK_PNPT_IS_C0 = -23028;
     int24 private constant TICK_FNBT_IS_C0 =  23027;
 
@@ -57,51 +53,88 @@ contract RewardTokensManager {
     }
 
     function getCanonicalCurrencies() public view returns (address currency0, address currency1) {
-        if (pnpToken < fnbToken) {
-            return (pnpToken, fnbToken);
-        } else {
-            return (fnbToken, pnpToken);
-        }
+        return pnpToken < fnbToken ? (pnpToken, fnbToken) : (fnbToken, pnpToken);
     }
 
-    function getPoolId() public view returns (bytes32) {
-        return _poolId;
-    }
+    function getPoolId() public view returns (bytes32) { return _poolId; }
 
-    // Returns the tick that corresponds to the assignment exchange rate (1 FNBT = 10 PNPT).
-    // The tick depends on which token ends up as currency0 (determined by address ordering).
-    // We compute this at runtime because token addresses are only known post-deployment.
     function getTargetTick() public view returns (int24) {
         (address c0, ) = getCanonicalCurrencies();
-        // If PNPT is the lower address it becomes currency0, price = FNBT/PNPT = 0.1 → tick -23028
-        // If FNBT is the lower address it becomes currency0, price = PNPT/FNBT = 10  → tick  23027
         return (c0 == pnpToken) ? TICK_PNPT_IS_C0 : TICK_FNBT_IS_C0;
     }
 
     function createPool(uint160 sqrtPriceX96) external returns (bytes32 poolId) {
         (address c0addr, address c1addr) = getCanonicalCurrencies();
-
         _poolKey = PoolKey({
-            currency0:   Currency.wrap(c0addr),
-            currency1:   Currency.wrap(c1addr),
-            fee:         FEE_TIER,
-            tickSpacing: TICK_SPACING,
-            hooks:       IHooks(HOOKS)
+            currency0: Currency.wrap(c0addr), currency1: Currency.wrap(c1addr),
+            fee: FEE_TIER, tickSpacing: TICK_SPACING, hooks: IHooks(HOOKS)
         });
-
         poolId  = PoolId.unwrap(_poolKey.toId());
         _poolId = poolId;
         createdPools[poolId] = true;
-
         poolManager.initialize(_poolKey, sqrtPriceX96);
-
         emit PoolCreated(poolId, c0addr, c1addr, FEE_TIER, TICK_SPACING, HOOKS, sqrtPriceX96);
     }
 
+    // Add concentrated liquidity to the pool within [tickLower, tickUpper].
+    // The range must cover getTargetTick() — the assignment-implied 1 FNBT = 10 PNPT price.
     function mintLiquidity(
         int24   tickLower,
         int24   tickUpper,
         uint256 amount0Desired,
         uint256 amount1Desired
-    ) external returns (uint256 positionId, bytes32 poolId) {}
+    ) external returns (uint256 positionId, bytes32 poolId) {
+        // Revert if the tick range doesn't include the assignment price point
+        int24 targetTick = getTargetTick();
+        if (tickLower > targetTick || tickUpper < targetTick) {
+            revert TickRangeDoesNotCoverAssignmentPrice();
+        }
+
+        poolId = _poolId;
+
+        // Read current pool price from on-chain state
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(PoolId.wrap(poolId));
+
+        // Compute max liquidity we can get from the desired token amounts
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            amount0Desired,
+            amount1Desired
+        );
+
+        Currency currency0 = _poolKey.currency0;
+        Currency currency1 = _poolKey.currency1;
+        address  c0addr    = Currency.unwrap(currency0);
+        address  c1addr    = Currency.unwrap(currency1);
+
+        // Pull tokens from caller into this contract
+        if (amount0Desired > 0) IERC20(c0addr).transferFrom(msg.sender, address(this), amount0Desired);
+        if (amount1Desired > 0) IERC20(c1addr).transferFrom(msg.sender, address(this), amount1Desired);
+
+        // Give Permit2 permission to move tokens on behalf of this contract to PoolManager
+        IERC20(c0addr).approve(_permit2, type(uint256).max);
+        IERC20(c1addr).approve(_permit2, type(uint256).max);
+
+        // Encode MINT_POSITION + SETTLE_PAIR actions for PositionManager
+        bytes memory actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
+        bytes[] memory params = new bytes[](2);
+        // Mint the NFT position directly to msg.sender (not this contract)
+        params[0] = abi.encode(_poolKey, tickLower, tickUpper, uint256(liquidity),
+            uint128(amount0Desired), uint128(amount1Desired), msg.sender, bytes(""));
+        params[1] = abi.encode(currency0, currency1);
+
+        // Capture the next token ID before minting
+        positionId = positionManager.nextTokenId();
+        positionManager.modifyLiquidities(abi.encode(actions, params), block.timestamp);
+
+        // Return any unspent tokens (dust) back to the caller
+        uint256 dust0 = IERC20(c0addr).balanceOf(address(this));
+        uint256 dust1 = IERC20(c1addr).balanceOf(address(this));
+        if (dust0 > 0) IERC20(c0addr).transfer(msg.sender, dust0);
+        if (dust1 > 0) IERC20(c1addr).transfer(msg.sender, dust1);
+
+        emit LiquidityMinted(poolId, positionId, msg.sender, tickLower, tickUpper, liquidity);
+    }
 }
